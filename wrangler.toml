@@ -1,0 +1,22 @@
+name = "echo-business-manager"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+ENVIRONMENT = "production"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "echo-prime-media"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-business-manager"
+database_id = "216edb7a-2eba-49ad-9569-62a17fe71cfb"
+
+[[services]]
+binding = "DOC_DELIVERY"
+service = "echo-document-delivery"
+
+# Secrets (set via wrangler secret put):
+# ADMIN_API_KEY — admin operations (tenant CRUD)
