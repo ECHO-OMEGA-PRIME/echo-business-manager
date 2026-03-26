@@ -258,60 +258,65 @@ app.get('/quotes/approve/:token', async (c) => {
 
 // Customer approves or rejects the estimate
 app.post('/quotes/approve/:token', async (c) => {
-  const b = await c.req.json() as any;
-  const action = b.action; // 'approve' or 'reject'
-  if (!action || !['approve', 'reject'].includes(action)) return c.json({ error: 'action must be approve or reject' }, 400);
+  try {
+    const b = await c.req.json() as any;
+    const action = b.action; // 'approve' or 'reject'
+    if (!action || !['approve', 'reject'].includes(action)) return c.json({ error: 'action must be approve or reject' }, 400);
 
-  const q = await c.env.DB.prepare(
-    'SELECT q.*, t.id as t_id FROM quotes q JOIN tenants t ON q.tenant_id = t.id WHERE q.approval_token = ?'
-  ).bind(c.req.param('token')).first() as any;
-  if (!q) return c.json({ error: 'Estimate not found' }, 404);
-  if (q.approval_status !== 'none' && q.approval_status !== 'pending') {
-    return c.json({ error: `This estimate has already been ${q.approval_status}` }, 400);
-  }
-  if (q.status === 'expired' || q.status === 'converted') {
-    return c.json({ error: `This estimate is ${q.status} and cannot be acted upon` }, 400);
-  }
-
-  if (action === 'approve') {
-    // Mark quote as approved
-    await c.env.DB.prepare(
-      "UPDATE quotes SET status = 'accepted', approval_status = 'approved', approved_at = datetime('now'), approval_name = ?, approval_notes = ?, updated_at = datetime('now') WHERE id = ?"
-    ).bind(b.name || '', b.notes || '', q.id).run();
-
-    // Auto-create a booking/job that needs to be scheduled
-    const bookingId = uid();
-    const items = await c.env.DB.prepare('SELECT description FROM quote_items WHERE quote_id = ?').bind(q.id).all();
-    const desc = (items.results as any[]).map(i => i.description).join(', ');
-    await c.env.DB.prepare(
-      "INSERT INTO bookings (id, tenant_id, contact_id, title, description, scheduled_date, quoted_price, status) VALUES (?,?,?,?,?,?,?,?)"
-    ).bind(bookingId, q.tenant_id, q.contact_id || null, `Job from ${q.quote_number}`, `Approved estimate: ${desc}`, '', q.total || 0, 'needs_scheduling').run();
-
-    // Link the booking back to the quote
-    await c.env.DB.prepare('UPDATE quotes SET booking_id = ? WHERE id = ?').bind(bookingId, q.id).run();
-
-    // Log activity on contact
-    if (q.contact_id) {
-      await c.env.DB.prepare('INSERT INTO contact_activities (id, tenant_id, contact_id, type, title, metadata) VALUES (?,?,?,?,?,?)')
-        .bind(uid(), q.tenant_id, q.contact_id, 'booking', `Estimate ${q.quote_number} approved → Job created`, JSON.stringify({ quote_id: q.id, booking_id: bookingId })).run();
+    const q = await c.env.DB.prepare(
+      'SELECT * FROM quotes WHERE approval_token = ?'
+    ).bind(c.req.param('token')).first() as any;
+    if (!q) return c.json({ error: 'Estimate not found' }, 404);
+    if (q.approval_status !== 'none' && q.approval_status !== 'pending') {
+      return c.json({ error: `This estimate has already been ${q.approval_status}` }, 400);
+    }
+    if (q.status === 'expired' || q.status === 'converted') {
+      return c.json({ error: `This estimate is ${q.status} and cannot be acted upon` }, 400);
     }
 
-    // Create a task for the team to schedule it
-    await c.env.DB.prepare(
-      "INSERT INTO tasks (id, tenant_id, title, description, status, priority, contact_id, booking_id, created_by) VALUES (?,?,?,?,?,?,?,?,?)"
-    ).bind(uid(), q.tenant_id, `Schedule job from ${q.quote_number}`, `Customer approved estimate ${q.quote_number} ($${(q.total||0).toFixed(2)}). Job needs to be scheduled.`, 'pending', 'high', q.contact_id||null, bookingId, 'system').run();
+    if (action === 'approve') {
+      // Mark quote as approved
+      await c.env.DB.prepare(
+        "UPDATE quotes SET status = 'accepted', approval_status = 'approved', approved_at = datetime('now'), approval_name = ?, approval_notes = ?, updated_at = datetime('now') WHERE id = ?"
+      ).bind(b.name || '', b.notes || '', q.id).run();
 
-    return c.json({ ok: true, message: 'Estimate approved! We will contact you to schedule your appointment.', booking_id: bookingId });
-  } else {
-    // Reject
-    await c.env.DB.prepare(
-      "UPDATE quotes SET status = 'rejected', approval_status = 'rejected', approval_name = ?, approval_notes = ?, updated_at = datetime('now') WHERE id = ?"
-    ).bind(b.name || '', b.notes || '', q.id).run();
-    if (q.contact_id) {
-      await c.env.DB.prepare('INSERT INTO contact_activities (id, tenant_id, contact_id, type, title) VALUES (?,?,?,?,?)')
-        .bind(uid(), q.tenant_id, q.contact_id, 'note', `Estimate ${q.quote_number} declined${b.notes ? ': ' + b.notes : ''}`).run();
+      // Auto-create a booking/job that needs to be scheduled
+      const bookingId = uid();
+      const items = await c.env.DB.prepare('SELECT description FROM quote_items WHERE quote_id = ?').bind(q.id).all();
+      const desc = (items.results as any[]).map((i: any) => i.description).join(', ');
+      await c.env.DB.prepare(
+        "INSERT INTO bookings (id, tenant_id, contact_id, title, description, scheduled_date, quoted_price, status) VALUES (?,?,?,?,?,?,?,?)"
+      ).bind(bookingId, q.tenant_id, q.contact_id || null, 'Job from ' + q.quote_number, 'Approved estimate: ' + desc, '', q.total || 0, 'needs_scheduling').run();
+
+      // Link the booking back to the quote
+      await c.env.DB.prepare('UPDATE quotes SET booking_id = ? WHERE id = ?').bind(bookingId, q.id).run();
+
+      // Log activity on contact
+      if (q.contact_id) {
+        await c.env.DB.prepare('INSERT INTO contact_activities (id, tenant_id, contact_id, type, title, metadata) VALUES (?,?,?,?,?,?)')
+          .bind(uid(), q.tenant_id, q.contact_id, 'booking', 'Estimate ' + q.quote_number + ' approved - Job created', JSON.stringify({ quote_id: q.id, booking_id: bookingId })).run();
+      }
+
+      // Create a task for the team to schedule it
+      const totalStr = (q.total || 0).toFixed(2);
+      await c.env.DB.prepare(
+        "INSERT INTO tasks (id, tenant_id, title, description, status, priority, contact_id, booking_id, created_by) VALUES (?,?,?,?,?,?,?,?,?)"
+      ).bind(uid(), q.tenant_id, 'Schedule job from ' + q.quote_number, 'Customer approved estimate ' + q.quote_number + ' ($' + totalStr + '). Job needs to be scheduled.', 'pending', 'high', q.contact_id || null, bookingId, 'system').run();
+
+      return c.json({ ok: true, message: 'Estimate approved! We will contact you to schedule your appointment.', booking_id: bookingId });
+    } else {
+      // Reject
+      await c.env.DB.prepare(
+        "UPDATE quotes SET status = 'rejected', approval_status = 'rejected', approval_name = ?, approval_notes = ?, updated_at = datetime('now') WHERE id = ?"
+      ).bind(b.name || '', b.notes || '', q.id).run();
+      if (q.contact_id) {
+        await c.env.DB.prepare('INSERT INTO contact_activities (id, tenant_id, contact_id, type, title) VALUES (?,?,?,?,?)')
+          .bind(uid(), q.tenant_id, q.contact_id, 'note', 'Estimate ' + q.quote_number + ' declined' + (b.notes ? ': ' + b.notes : '')).run();
+      }
+      return c.json({ ok: true, message: 'Estimate declined. Thank you for your time.' });
     }
-    return c.json({ ok: true, message: 'Estimate declined. Thank you for your time.' });
+  } catch (e: any) {
+    return c.json({ error: 'Approval failed', detail: e.message }, 500);
   }
 });
 
