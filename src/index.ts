@@ -1838,4 +1838,17 @@ app.get('/api/audit-log', async (c) => {
   return c.json({ log: (await c.env.DB.prepare(sql).bind(...params).all()).results });
 });
 
+
+app.onError((err, c) => {
+  if (err.message?.includes('JSON')) {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+  console.error(`[echo-business-manager] ${err.message}`);
+  return c.json({ error: 'Internal server error' }, 500);
+});
+
+app.notFound((c) => {
+  return c.json({ error: 'Not found' }, 404);
+});
+
 export default app;
