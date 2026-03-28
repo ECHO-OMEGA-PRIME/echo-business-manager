@@ -10,6 +10,7 @@
 
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { getPortalHTML } from './portal-html';
 
 interface Env {
   DB: D1Database;
@@ -66,6 +67,11 @@ app.use('/api/*', async (c, next) => {
 
 app.get('/', (c) => c.json({ service: 'echo-business-manager', version: '1.0.0', status: 'ok' }));
 app.get('/health', (c) => c.json({ status: 'healthy', service: 'echo-business-manager', version: '1.0.0', timestamp: new Date().toISOString() }));
+
+// ═══ UNIVERSAL OWNER PORTAL ═══
+// Serves a fully functional dashboard for ANY tenant — ProFinish, Clean Brees, etc.
+// Auto-brands via tenant settings (colors, logo, company name)
+app.get('/portal', (c) => c.html(getPortalHTML()));
 
 app.post('/init-schema', async (c) => {
   const denied = requireAdmin(c);
