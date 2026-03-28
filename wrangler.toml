@@ -20,3 +20,7 @@ service = "echo-document-delivery"
 
 # Secrets (set via wrangler secret put):
 # ADMIN_API_KEY — admin operations (tenant CRUD)
+
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "echo_metrics"
