@@ -35,6 +35,16 @@ const uid = () => crypto.randomUUID().replace(/-/g, '').slice(0, 16);
 const uuid = () => crypto.randomUUID();
 
 app.use('*', cors({ origin: '*', allowMethods: ['GET','POST','PUT','DELETE','PATCH','OPTIONS'] }));
+// Security headers middleware
+app.use('*', async (c, next) => {
+  await next();
+  c.res.headers.set('X-Content-Type-Options', 'nosniff');
+  c.res.headers.set('X-Frame-Options', 'DENY');
+  c.res.headers.set('X-XSS-Protection', '1; mode=block');
+  c.res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  c.res.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+});
+
 
 // ═══════════════════════════════════════════════════════════
 // AUTH HELPERS
