@@ -12,11 +12,15 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { getPortalHTML } from './portal-html';
 
+const ALLOWED_ORIGINS = ['https://echo-ept.com','https://www.echo-ept.com','https://echo-op.com','https://profinishusa.com','https://bgat.echo-op.com'];
+
 interface Env {
   DB: D1Database;
   R2: R2Bucket;
   DOC_DELIVERY: Fetcher;
   ADMIN_API_KEY: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
 }
 
 interface Tenant {
@@ -34,7 +38,7 @@ const app = new Hono<{ Bindings: Env; Variables: { tenant: Tenant } }>();
 const uid = () => crypto.randomUUID().replace(/-/g, '').slice(0, 16);
 const uuid = () => crypto.randomUUID();
 
-app.use('*', cors({ origin: '*', allowMethods: ['GET','POST','PUT','DELETE','PATCH','OPTIONS'] }));
+app.use('*', cors({ origin: (o) => ALLOWED_ORIGINS.includes(o) ? o : ALLOWED_ORIGINS[0], allowMethods: ['GET','POST','PUT','DELETE','PATCH','OPTIONS'] }));
 // Security headers middleware
 app.use('*', async (c, next) => {
   await next();
@@ -75,8 +79,19 @@ app.use('/api/*', async (c, next) => {
 // HEALTH & SCHEMA
 // ═══════════════════════════════════════════════════════════
 
-app.get('/', (c) => c.json({ service: 'echo-business-manager', version: '1.0.0', status: 'ok' }));
-app.get('/health', (c) => c.json({ status: 'healthy', service: 'echo-business-manager', version: '1.0.0', timestamp: new Date().toISOString() }));
+app.get('/', (c) => c.json({ service: 'echo-business-manager', version: '2.0.0', status: 'ok', features: ['multi-tenant', 'crm', 'invoicing', 'stripe-payments'] }));
+app.get('/health', async (c) => {
+  let dbOk = false;
+  try { const r = await c.env.DB.prepare('SELECT 1').first(); dbOk = !!r; } catch {}
+  return c.json({
+    status: dbOk ? 'healthy' : 'degraded',
+    service: 'echo-business-manager',
+    version: '2.0.0',
+    timestamp: new Date().toISOString(),
+    stripe: { configured: !!c.env.STRIPE_SECRET_KEY, webhook_configured: !!c.env.STRIPE_WEBHOOK_SECRET },
+    d1: dbOk ? 'connected' : 'error',
+  });
+});
 
 // ═══ UNIVERSAL OWNER PORTAL ═══
 // Serves a fully functional dashboard for ANY tenant — ProFinish, Clean Brees, etc.
@@ -1848,6 +1863,231 @@ app.get('/api/audit-log', async (c) => {
   return c.json({ log: (await c.env.DB.prepare(sql).bind(...params).all()).results });
 });
 
+
+// ═══════════════════════════════════════════════════════════
+// STRIPE PAYMENT INTEGRATION
+// ═══════════════════════════════════════════════════════════
+
+const STRIPE_PLANS = [
+  { id: 'starter',    name: 'Starter',    price: 3999,  display: '$39.99/mo',  features: ['Up to 100 contacts', 'Basic invoicing', 'Email support', '1 user'] },
+  { id: 'growth',     name: 'Growth',     price: 9999,  display: '$99.99/mo',  features: ['Up to 1,000 contacts', 'Full CRM + deals pipeline', 'SMS + email campaigns', '5 users', 'AI assistant'] },
+  { id: 'scale',      name: 'Scale',      price: 24999, display: '$249.99/mo', features: ['Up to 10,000 contacts', 'All Growth features', 'Custom branding', 'API access', '25 users', 'Priority support'] },
+  { id: 'enterprise', name: 'Enterprise', price: 49999, display: '$499.99/mo', features: ['Unlimited contacts', 'All Scale features', 'White-label', 'Dedicated account manager', 'Unlimited users', 'SLA guarantee', 'Custom integrations'] },
+];
+
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  try {
+    const parts = sigHeader.split(',');
+    let timestamp = '';
+    let signature = '';
+    for (const part of parts) {
+      const [key, val] = part.trim().split('=');
+      if (key === 't') timestamp = val;
+      if (key === 'v1') signature = val;
+    }
+    if (!timestamp || !signature) return false;
+    // Replay protection: reject events older than 5 minutes
+    const age = Math.floor(Date.now() / 1000) - parseInt(timestamp);
+    if (Math.abs(age) > 300) return false;
+    const signedPayload = `${timestamp}.${payload}`;
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
+    const expected = new Uint8Array(mac);
+    const received = new Uint8Array(signature.match(/.{2}/g)!.map(b => parseInt(b, 16)));
+    if (expected.length !== received.length) return false;
+    // Constant-time comparison via XOR
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) diff |= expected[i] ^ received[i];
+    return diff === 0;
+  } catch { return false; }
+}
+
+// GET /plans — public, no auth
+app.get('/plans', (c) => c.json({ plans: STRIPE_PLANS, currency: 'usd' }));
+
+// POST /webhooks/stripe — Stripe webhook receiver (NO auth middleware, NO rate limiting)
+app.post('/webhooks/stripe', async (c) => {
+  const stripeKey = c.env.STRIPE_SECRET_KEY;
+  const webhookSecret = c.env.STRIPE_WEBHOOK_SECRET;
+  if (!stripeKey) return c.json({ error: 'Stripe not configured' }, 503);
+
+  const body = await c.req.text();
+  const sig = c.req.header('Stripe-Signature') || '';
+
+  if (webhookSecret) {
+    const valid = await verifyStripeSignature(body, sig, webhookSecret);
+    if (!valid) return c.json({ error: 'Invalid signature' }, 401);
+  }
+
+  let event: any;
+  try { event = JSON.parse(body); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+
+  const type = event.type;
+  const obj = event.data?.object;
+
+  try {
+    switch (type) {
+      case 'checkout.session.completed': {
+        const tenantId = obj.metadata?.tenant_id;
+        const planId = obj.metadata?.plan_id;
+        if (tenantId && planId) {
+          await c.env.DB.prepare(
+            "INSERT INTO subscriptions (id, tenant_id, stripe_customer_id, stripe_subscription_id, plan_id, status, current_period_start, current_period_end, created_at) VALUES (?,?,?,?,?,?,datetime('now'),datetime('now', '+30 days'),datetime('now'))"
+          ).bind(uid(), tenantId, obj.customer || '', obj.subscription || '', planId, 'active').run();
+          await c.env.DB.prepare("UPDATE tenants SET updated_at = datetime('now') WHERE id = ?").bind(tenantId).run();
+        }
+        break;
+      }
+      case 'invoice.paid': {
+        const subId = obj.subscription;
+        if (subId) {
+          await c.env.DB.prepare(
+            "UPDATE subscriptions SET status = 'active', updated_at = datetime('now') WHERE stripe_subscription_id = ?"
+          ).bind(subId).run();
+          await c.env.DB.prepare(
+            "INSERT INTO subscription_events (id, stripe_subscription_id, event_type, amount, currency, created_at) VALUES (?,?,?,?,?,datetime('now'))"
+          ).bind(uid(), subId, 'invoice.paid', obj.amount_paid || 0, obj.currency || 'usd').run();
+        }
+        break;
+      }
+      case 'invoice.payment_failed': {
+        const subId = obj.subscription;
+        if (subId) {
+          await c.env.DB.prepare(
+            "UPDATE subscriptions SET status = 'past_due', updated_at = datetime('now') WHERE stripe_subscription_id = ?"
+          ).bind(subId).run();
+          await c.env.DB.prepare(
+            "INSERT INTO subscription_events (id, stripe_subscription_id, event_type, amount, currency, created_at) VALUES (?,?,?,?,?,datetime('now'))"
+          ).bind(uid(), subId, 'invoice.payment_failed', obj.amount_due || 0, obj.currency || 'usd').run();
+        }
+        break;
+      }
+      case 'customer.subscription.updated': {
+        const subId = obj.id;
+        const status = obj.status === 'active' ? 'active' : obj.status === 'past_due' ? 'past_due' : obj.status === 'canceled' ? 'canceled' : obj.status;
+        await c.env.DB.prepare(
+          "UPDATE subscriptions SET status = ?, current_period_start = ?, current_period_end = ?, updated_at = datetime('now') WHERE stripe_subscription_id = ?"
+        ).bind(status, new Date((obj.current_period_start || 0) * 1000).toISOString(), new Date((obj.current_period_end || 0) * 1000).toISOString(), subId).run();
+        break;
+      }
+      case 'customer.subscription.deleted': {
+        await c.env.DB.prepare(
+          "UPDATE subscriptions SET status = 'canceled', updated_at = datetime('now') WHERE stripe_subscription_id = ?"
+        ).bind(obj.id).run();
+        break;
+      }
+    }
+    return c.json({ received: true, type });
+  } catch (e: any) {
+    console.error(`[stripe-webhook] ${type}: ${e.message}`);
+    return c.json({ error: 'Webhook processing failed' }, 500);
+  }
+});
+
+// POST /plans/upgrade — create Stripe checkout session (tenant-scoped)
+app.post('/api/plans/upgrade', async (c) => {
+  const t = c.get('tenant');
+  const stripeKey = c.env.STRIPE_SECRET_KEY;
+  if (!stripeKey) return c.json({ error: 'Stripe not configured' }, 503);
+
+  const b = await c.req.json() as any;
+  const plan = STRIPE_PLANS.find(p => p.id === b.plan_id);
+  if (!plan) return c.json({ error: 'Invalid plan_id. Options: starter, growth, scale, enterprise' }, 400);
+
+  const successUrl = b.success_url || `https://echo-ept.com/dashboard?upgrade=success&plan=${plan.id}`;
+  const cancelUrl = b.cancel_url || `https://echo-ept.com/pricing?upgrade=canceled`;
+
+  const params = new URLSearchParams({
+    'mode': 'subscription',
+    'payment_method_types[0]': 'card',
+    'line_items[0][price_data][currency]': 'usd',
+    'line_items[0][price_data][product_data][name]': `Echo Business Manager — ${plan.name}`,
+    'line_items[0][price_data][product_data][description]': plan.features.join(', '),
+    'line_items[0][price_data][unit_amount]': plan.price.toString(),
+    'line_items[0][price_data][recurring][interval]': 'month',
+    'line_items[0][quantity]': '1',
+    'metadata[tenant_id]': t.id,
+    'metadata[plan_id]': plan.id,
+    'metadata[tenant_name]': t.name,
+    'success_url': successUrl,
+    'cancel_url': cancelUrl,
+    'customer_email': t.company_email || '',
+  });
+
+  const resp = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${stripeKey}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: params.toString(),
+  });
+  const session = await resp.json() as any;
+  if (!resp.ok) return c.json({ error: 'Stripe API error', detail: session.error?.message || 'Unknown' }, 502);
+  return c.json({ checkout_url: session.url, session_id: session.id, plan: plan.id });
+});
+
+// POST /admin/migrate-stripe — create subscription tables
+app.post('/admin/migrate-stripe', async (c) => {
+  const denied = requireAdmin(c);
+  if (denied) return denied;
+  const stmts = [
+    `CREATE TABLE IF NOT EXISTS subscriptions (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      stripe_customer_id TEXT,
+      stripe_subscription_id TEXT,
+      plan_id TEXT NOT NULL,
+      status TEXT DEFAULT 'active',
+      current_period_start TEXT,
+      current_period_end TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    )`,
+    `CREATE TABLE IF NOT EXISTS subscription_events (
+      id TEXT PRIMARY KEY,
+      stripe_subscription_id TEXT,
+      event_type TEXT NOT NULL,
+      amount INTEGER DEFAULT 0,
+      currency TEXT DEFAULT 'usd',
+      created_at TEXT DEFAULT (datetime('now'))
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_subscriptions_tenant ON subscriptions(tenant_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe ON subscriptions(stripe_subscription_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_sub_events_stripe ON subscription_events(stripe_subscription_id)`,
+  ];
+  const results = [];
+  for (const sql of stmts) {
+    try { await c.env.DB.prepare(sql).run(); results.push({ sql: sql.slice(0, 60), ok: true }); }
+    catch (e: any) { results.push({ sql: sql.slice(0, 60), ok: false, error: e.message }); }
+  }
+  return c.json({ ok: true, migrations: results });
+});
+
+// GET /api/subscription — tenant's current subscription
+app.get('/api/subscription', async (c) => {
+  const t = c.get('tenant');
+  const sub = await c.env.DB.prepare(
+    "SELECT * FROM subscriptions WHERE tenant_id = ? AND status IN ('active','past_due') ORDER BY created_at DESC LIMIT 1"
+  ).bind(t.id).first();
+  if (!sub) return c.json({ subscription: null, plan: null });
+  const plan = STRIPE_PLANS.find(p => p.id === (sub as any).plan_id);
+  return c.json({ subscription: sub, plan: plan || null });
+});
+
+// GET /api/subscription/events — billing history
+app.get('/api/subscription/events', async (c) => {
+  const t = c.get('tenant');
+  const sub = await c.env.DB.prepare(
+    "SELECT stripe_subscription_id FROM subscriptions WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1"
+  ).bind(t.id).first() as any;
+  if (!sub) return c.json({ events: [] });
+  const events = await c.env.DB.prepare(
+    'SELECT * FROM subscription_events WHERE stripe_subscription_id = ? ORDER BY created_at DESC LIMIT 50'
+  ).bind(sub.stripe_subscription_id).all();
+  return c.json({ events: events.results });
+});
 
 app.onError((err, c) => {
   if (err.message?.includes('JSON')) {
